@@ -19,6 +19,7 @@ module XP5K
       @roles              = []
       @links_deployments  = {"jobs" => {}, "roles" => {}}
       @deployed_nodes     = {"jobs" => {}, "roles" => {}}
+      @retries            = options[:retries] || 3
       @starttime          = Time.now
       @logger             = options[:logger] || Logger.new(STDOUT)
 
@@ -41,29 +42,66 @@ module XP5K
     def define_deployment(deployment_hash)
       deployment_hash[:jobs] ||= []
       deployment_hash[:roles] ||= []
+      
       self.todeploy << deployment_hash
     end
 
-    def deploy
+    def deploy()
+
+      self.internal_deploy(@retries)
+
+      print_deploy_summary
+
+    end
+    
+    def internal_deploy(n)
+
+      if (n<=0)
+        return
+      end
+
+      # Fill with nodes to deployed
       self.todeploy.each do |x|
-        x[:nodes] ||= []
+        x[:nodes] = []
         # Get assigned resources to deploy
         x[:jobs].each do |jobname|
           job = self.job_with_name(jobname)
-          x[:nodes] += job["assigned_nodes"]
+          self.deployed_nodes["jobs"][jobname] ||= []
+          # check here if we have reach the min wanted
+          x[:nodes] += job["assigned_nodes"] - self.deployed_nodes["jobs"][jobname]
         end
         x[:roles].each do |rolename|
-          x[:nodes] += role_with_name(rolename).servers
+          role = role_with_name(rolename)
+          self.deployed_nodes["roles"][rolename] ||= []
+          # check here if we have reach the min wanted
+          x[:nodes] += role.servers - self.deployed_nodes["roles"][rolename]
         end
+      end
+
+      # Clean todeploy
+      self.todeploy.delete_if{ |x| x[:nodes].empty?}
+      if self.todeploy.empty? 
+        return
+      end
+
+      if (n<@retries)
+        logger.info "Redeployment of undeployed nodes"
+      end
+
+      # Launch deployments
+      self.todeploy.each do |y|
+        x = y.clone  
         site = x[:site]
         x.delete(:site)
         x.delete(:roles)
         x.delete(:jobs)
+
         deployment = @connection.root.sites[site.to_sym].deployments.submit(x)
         self.deployments << deployment
-        # update links_deployments
-        update_links_deployments(deployment["uid"], x)
+        # Update links_deployments
+        update_links_deployments(deployment["uid"], y)
       end
+
       logger.info "Waiting for all the deployments to be terminated..."
       finished = self.deployments.reduce(true){ |acc, d| acc && d["status"]!='processing'}
       while (!finished)
@@ -74,9 +112,14 @@ module XP5K
         end
         finished = self.deployments.reduce(true){ |acc, d| acc && d["status"]!='processing'}
       end
+      print(" [#{green("OK")}]\n")
+
+      # Update deployed nodes
       update_deployed_nodes()
       update_cache()
-      print(" [#{green("OK")}]\n")
+
+      self.internal_deploy(n - 1)
+
     end
 
     def define_job(job_hash)
@@ -146,11 +189,11 @@ module XP5K
     end
 
     def get_deployed_nodes(job_or_role_name)
-      if deployed_nodes["jobs"].has_key?(job_or_role_name)
-        deployed_nodes["jobs"][job_or_role_name]
+      if self.deployed_nodes["jobs"].has_key?(job_or_role_name)
+        return self.deployed_nodes["jobs"][job_or_role_name]
       end
-      if deployed_nodes["roles"].has_key?(job_or_role_name)
-        deployed_nodes["roles"][job_or_role_name]
+      if self.deployed_nodes["roles"].has_key?(job_or_role_name)
+        return self.deployed_nodes["roles"][job_or_role_name]
       end
     end
 
@@ -179,40 +222,48 @@ module XP5K
     def update_links_deployments (duid, todeploy)
       unless todeploy[:jobs].nil?
         todeploy[:jobs].each do |job|
-          @links_deployments["jobs"][job] = duid  
+          @links_deployments["jobs"][job] ||= []  
+          @links_deployments["jobs"][job] << duid  
         end
       end
 
       unless todeploy[:roles].nil?
         todeploy[:roles].each do |role|
-          @links_deployments["roles"][role] = duid  
+          @links_deployments["roles"][role] ||= []  
+          @links_deployments["roles"][role] << duid  
         end
       end
     end
 
     def update_deployed_nodes
-      self.deployments.each do |deployment|
-        duid = deployment["uid"]
-        self.links_deployments["jobs"].select{|k,v| v == duid }.keys.each do |job_name|
-          job = job_with_name(job_name)
-          deployed_nodes["jobs"][job["name"]] = intersect_nodes_job(job, deployment)
+      self.links_deployments["jobs"].each do |jobname,v|
+        job = job_with_name(jobname)
+        deployed_nodes["jobs"][jobname]=[]
+        v.each do |duid| 
+          deployment = self.deployments.select{ |d| d["uid"] == duid}.first
+          deployed_nodes["jobs"][jobname] += intersect_nodes_job(job, deployment)
         end
-        self.links_deployments["roles"].select{|k,v| v == duid }.keys.each do |role_name|
-          role = role_with_name(role_name)
-          deployed_nodes["roles"][role.name] = intersect_nodes_role(role, deployment)
-        end
-
       end
+
+      self.links_deployments["roles"].each do |rolename,v|
+        role = role_with_name(rolename)
+        deployed_nodes["roles"][rolename]=[]
+        v.each do |duid| 
+          deployment = self.deployments.select{ |d| d["uid"] == duid}.first
+          deployed_nodes["roles"][rolename] += intersect_nodes_role(role, deployment)
+        end
+      end
+
     end
     
     def intersect_nodes_job (job, deployment)
       nodes_deployed = deployment["result"].select{ |k,v| v["state"]=='OK'}.keys
-      job["assigned_nodes"] & nodes_deployed
+      return job["assigned_nodes"] & nodes_deployed
     end
 
     def intersect_nodes_role (role, deployment)
       nodes_deployed = deployment["result"].select{ |k,v| v["state"]=='OK'}.keys
-      role.servers & nodes_deployed
+      return role.servers & nodes_deployed
     end
     
     def update_cache
@@ -227,5 +278,29 @@ module XP5K
       end
     end
 
+    def print_deploy_summary
+      puts "Summary of the deployment"
+      puts "-" * 60 
+      printf "%+20s", "Name"
+      printf "%+20s", "Deployed"
+      printf "%+20s", "Undeployed"
+      puts "\n"
+      puts "-" * 60 
+
+      self.deployed_nodes["jobs"].each do |jobname, deployed_nodes|
+        puts "\n"
+        printf "%+20s",jobname 
+        printf "%20d", deployed_nodes.length
+        printf "%20d", job_with_name(jobname)["assigned_nodes"].length - deployed_nodes.length
+        puts "\n"
+      end
+
+      self.deployed_nodes["roles"].each do |rolename, deployed_nodes|
+        printf "%+20s",rolename 
+        printf "%20d", deployed_nodes.length
+        printf "%20d", role_with_name(rolename).servers.length - deployed_nodes.length
+        puts "\n"
+      end
+    end
   end
 end
