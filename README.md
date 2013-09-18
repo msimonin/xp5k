@@ -1,3 +1,4 @@
+
 ## Capistrano sample
 
     require 'xp5k'
