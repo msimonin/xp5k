@@ -42,16 +42,31 @@ module XP5K
     def define_deployment(deployment_hash)
       deployment_hash[:jobs] ||= []
       deployment_hash[:roles] ||= []
-      
       self.todeploy << deployment_hash
     end
 
     def deploy()
-
+      # prepare assigned_nodes, goals and retries value
+      self.todeploy.each do |x|
+        x[:assigned_nodes] = []
+        x[:jobs].each do |jobname|
+          job = self.job_with_name(jobname)
+          x[:assigned_nodes] += job["assigned_nodes"]
+        end
+        x[:roles].each do |rolename|
+          role = role_with_name(rolename)
+          x[:assigned_nodes] += role.servers
+        end
+        # initially all nodes have to be deployed
+        x[:nodes] = x[:assigned_nodes]
+        # set goal 
+        x[:goal] = set_goal(x[:goal], x[:assigned_nodes].length)
+        # set retries
+        x[:retry] ||= false
+        x[:retries] ||= x[:retry]?@retries:1
+      end
       self.internal_deploy(@retries)
-
       print_deploy_summary
-
     end
     
     def internal_deploy(n)
@@ -62,24 +77,24 @@ module XP5K
 
       # Fill with nodes to deployed
       self.todeploy.each do |x|
-        x[:nodes] = []
-        # Get assigned resources to deploy
+        x[:nodes] = x[:assigned_nodes] 
         x[:jobs].each do |jobname|
-          job = self.job_with_name(jobname)
           self.deployed_nodes["jobs"][jobname] ||= []
-          # check here if we have reach the min wanted
-          x[:nodes] += job["assigned_nodes"] - self.deployed_nodes["jobs"][jobname]
+          x[:nodes] = x[:nodes] - self.deployed_nodes["jobs"][jobname]
         end
         x[:roles].each do |rolename|
-          role = role_with_name(rolename)
           self.deployed_nodes["roles"][rolename] ||= []
-          # check here if we have reach the min wanted
-          x[:nodes] += role.servers - self.deployed_nodes["roles"][rolename]
+          x[:nodes] = x[:nodes] - self.deployed_nodes["roles"][rolename]
         end
       end
 
       # Clean todeploy
-      self.todeploy.delete_if{ |x| x[:nodes].empty?}
+      self.todeploy.delete_if{ |x|
+        x[:nodes].empty? ||
+        (x[:goal] >= 0) && ( x[:nodes].length < ((1-x[:goal])*(x[:assigned_nodes].length ))) ||
+        x[:retries] <= 0
+      }
+
       if self.todeploy.empty? 
         return
       end
@@ -95,11 +110,16 @@ module XP5K
         x.delete(:site)
         x.delete(:roles)
         x.delete(:jobs)
+        x.delete(:assigned_nodes)
+        x.delete(:goal)
+        x.delete(:retry)
+        x.delete(:retries)
 
         deployment = @connection.root.sites[site.to_sym].deployments.submit(x)
         self.deployments << deployment
         # Update links_deployments
         update_links_deployments(deployment["uid"], y)
+        y[:retries] = y[:retries] - 1
       end
 
       logger.info "Waiting for all the deployments to be terminated..."
@@ -275,6 +295,22 @@ module XP5K
       }
       open(".xp_cache", "w") do |f|
         f.puts cache.to_json
+      end
+    end
+
+    def set_goal(goal, total)
+      if goal.nil?
+        return -1.0
+      end
+
+      if goal.to_s.include? "%"
+          return goal.to_f/100
+      elsif goal.to_f < 1
+        return goal.to_f
+      elsif goal.to_f == 1.0
+        return goal.to_f/total
+      else 
+        return goal.to_f/total
       end
     end
 
